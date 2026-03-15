@@ -238,6 +238,36 @@ impl ApiClient {
         Ok(parsed.links)
     }
 
+    // ── Key / address endpoints ───────────────────────────────────────────
+
+    /// `GET /core/v4/addresses` — list all addresses with their key material.
+    pub async fn get_addresses(&self) -> Result<Vec<Address>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp { code: i32, addresses: Vec<Address> }
+
+        let text = self.authed_get("/core/v4/addresses").await?;
+        let parsed: Resp = serde_json::from_str(&text)?;
+        if parsed.code != 1000 {
+            return Err(Error::Api { code: parsed.code, message: text });
+        }
+        Ok(parsed.addresses)
+    }
+
+    /// `GET /core/v4/keys/salts` — per-key bcrypt salts for key-password derivation.
+    pub async fn get_key_salts(&self) -> Result<Vec<KeySalt>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp { code: i32, key_salts: Vec<KeySalt> }
+
+        let text = self.authed_get("/core/v4/keys/salts").await?;
+        let parsed: Resp = serde_json::from_str(&text)?;
+        if parsed.code != 1000 {
+            return Err(Error::Api { code: parsed.code, message: text });
+        }
+        Ok(parsed.key_salts)
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
 
     /// Perform an authenticated GET to a path under `BASE_URL`.

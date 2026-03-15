@@ -80,6 +80,48 @@ pub struct RefreshRequest {
     pub response_type: String,  // "token"
 }
 
+// ── Address keys ──────────────────────────────────────────────────────────
+
+/// A single PGP key attached to an address.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AddressKey {
+    #[serde(rename = "ID")]
+    pub id: String,
+    /// PGP-armored encrypted private key.
+    pub private_key: String,
+    /// 1 = this is the primary key for the address.
+    pub primary: u32,
+    /// 1 = active (usable).
+    pub active: u32,
+    /// For migrated keys: PGP-armored token (encrypted with user key).
+    pub token: Option<String>,
+    /// For migrated keys: PGP-armored signature of the token.
+    pub signature: Option<String>,
+}
+
+/// A Proton mail/drive address with its associated keys.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Address {
+    #[serde(rename = "ID")]
+    pub id: String,
+    pub email: String,
+    pub keys: Vec<AddressKey>,
+}
+
+// ── Key salts ─────────────────────────────────────────────────────────────
+
+/// Per-key bcrypt salt used to derive the key password.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct KeySalt {
+    #[serde(rename = "ID")]
+    pub id: String,
+    /// Base64-encoded salt.  `None` means use the raw password directly.
+    pub key_salt: Option<String>,
+}
+
 // ── Stored session ────────────────────────────────────────────────────────
 
 /// Credentials stored in the system keyring after a successful login.

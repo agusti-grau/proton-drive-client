@@ -1,194 +1,249 @@
 # Proton Drive Client for Linux Mint
 
-A native GUI desktop application and CLI for Linux Mint that provides seamless two-way synchronization with [Proton Drive](https://proton.me/drive). Built with Rust.
+A native CLI and background daemon for Linux Mint that provides two-way synchronisation with [Proton Drive](https://proton.me/drive). Built in Rust.
 
-> **Status:** Concept / Planning — not yet functional. Contributions and feedback welcome.
+> **Status: Early development — authentication and remote file listing are working. Sync engine not yet implemented.**
 
 ---
 
-## Overview
+## What works today
 
-Proton Drive is an end-to-end encrypted cloud storage service. While Proton offers official clients for Windows, macOS, iOS, and Android, Linux users are currently left without a native desktop client. This project aims to fill that gap by providing a polished, first-class Proton Drive experience on Linux Mint.
+| Feature | Status |
+|---------|--------|
+| SRP-6a authentication (login, 2FA, logout, token refresh) | ✅ Working |
+| Session storage in system keyring (libsecret) | ✅ Working |
+| Remote volume / share enumeration | ✅ Working |
+| Remote file tree listing (depth-first walk) | ✅ Working |
+| PGP name decryption (full key-chain: address → share → node) | ✅ Working |
+| Local filesystem scanner | 🔲 Not started |
+| SQLite state DB (snapshots, sync queue) | 🔲 Not started |
+| Diff engine | 🔲 Not started |
+| File upload / download | 🔲 Not started |
+| `protond` IPC socket | 🔲 Not started |
+| GUI desktop app | 🔲 Not started |
 
 ---
 
 ## Architecture
 
-The system is composed of three binaries that communicate over a **Unix socket**:
+Three binaries sharing a Unix socket:
 
 ```
 ┌───────────────┐     ┌───────────────┐
 │  GUI Desktop  │     │   CLI client  │
-│     App       │     │ proton-drive  │
+│  App (future) │     │ proton-drive  │
 └───────┬───────┘     └───────┬───────┘
         │   Unix socket IPC   │
         └──────────┬──────────┘
                    │
          ┌─────────▼─────────┐
-         │   protond (daemon) │  ← single source of truth
+         │   protond (daemon) │
          │                   │
-         │  ┌─────────────┐  │
-         │  │  Auth       │  │  OAuth → browser → token
-         │  ├─────────────┤  │
-         │  │  Remote FS  │  │  Proton Drive API
-         │  ├─────────────┤  │
-         │  │  Local FS   │  │  inotify / walkdir
-         │  ├─────────────┤  │
-         │  │  Diff Engine│  │  Delta computation
-         │  ├─────────────┤  │
-         │  │  Sync Queue │  │  Prioritized job queue
-         │  ├─────────────┤  │
-         │  │  Transfer   │  │  Rate limiting + scheduling
-         │  │  Manager    │  │
-         │  └─────────────┘  │
+         │  Auth · Sync · Queue · Transfer
          └───────────────────┘
 ```
 
-### Components
+### Crate layout
 
-#### `protond` — Sync Daemon
+```
+Cargo.toml                     workspace root
+crates/
+  proton-core/                 library — all business logic
+    src/
+      api/
+        client.rs              ApiClient (HTTP, auth + drive endpoints)
+        types.rs               Auth API types
+        drive_types.rs         Drive API types (Volume, Share, Link, …)
+      auth/
+        mod.rs                 login(), complete_2fa(), refresh_session(), logout()
+        password.rs            bcrypt key derivation (SRP + key-password)
+        srp.rs                 SRP-6a math (expand_hash, proofs)
+      crypto/
+        mod.rs                 pgp_decrypt() — rpgp 0.14 wrapper
+      drive/
+        mod.rs                 DriveClient, DriveNode, walk_decrypted()
+        keyring.rs             DriveKeyring — key-chain management
+      keyring.rs               System keyring (libsecret) session storage
+      error.rs                 Error enum
+  protond/                     Daemon (skeleton — IPC not yet implemented)
+  proton-drive/                CLI client
+```
 
-The core background service. All business logic lives here. Starts on login via systemd user unit.
+### Sync pipeline (planned)
 
-**Sync pipeline (in order):**
+| Step | Description | Status |
+|------|-------------|--------|
+| 1 | Authenticate via SRP-6a → store session in libsecret | ✅ |
+| 2 | Enumerate remote tree, decrypt file names with PGP key chain | ✅ |
+| 3 | Enumerate local sync folder (walk + hash) | 🔲 |
+| 4 | Diff remote vs local vs last-known state (SQLite) | 🔲 |
+| 5 | Resolve conflicts — pause and notify user | 🔲 |
+| 6 | Build prioritised job queue (persisted to SQLite) | 🔲 |
+| 7 | Transfer with rate limiting + time-window scheduling | 🔲 |
 
-| Step | Description |
-|------|-------------|
-| 1. **Authenticate** | OAuth flow — opens system browser to `proton.me`, captures redirect token. Stores session token in system keyring via `libsecret`. |
-| 2. **Connect** | Establishes an authenticated session with the Proton Drive API. Refreshes tokens automatically. |
-| 3. **Enumerate remote** | Walks the remote drive tree via Proton API, decrypts file metadata (names, sizes, modified times) using the user's private key. |
-| 4. **Enumerate local** | Walks the configured local sync folder. Reads file metadata and computes hashes for changed files. |
-| 5. **Diff** | Compares remote and local snapshots against the last-known sync state stored in a local SQLite database. Classifies each file as: `unchanged`, `local_new`, `remote_new`, `local_modified`, `remote_modified`, `conflict`. |
-| 6. **Conflict resolution** | Files classified as `conflict` are paused. The user is notified via the GUI/CLI to resolve each conflict manually before sync resumes. |
-| 7. **Build queue** | Creates a prioritized job queue (small files first, then large). Jobs are persisted to SQLite so they survive restarts. |
-| 8. **Transfer** | Executes upload/download jobs with configurable rate limiting (separate upload/download caps in KB/s or MB/s) and optional time-window scheduling (e.g., sync only between 22:00–06:00). |
+---
 
-#### `proton-drive` — CLI Client
+## Authentication
 
-Thin client that sends commands to the daemon over the Unix socket and prints responses. Useful for scripting and headless servers.
+Proton does **not** use OAuth.  Authentication uses a custom **SRP-6a** variant:
+
+```
+POST /auth/v4/info  →  server ephemeral B, PGP-signed modulus N, bcrypt salt
+bcrypt(password, salt + "proton", cost=10)  →  60-byte bcrypt string
+expand_hash = SHA-512(data‖0) ‖ SHA-512(data‖1) ‖ SHA-512(data‖2) ‖ SHA-512(data‖3)
+x  = expand_hash(bcrypt_output ‖ modulus_bytes)
+K  = expand_hash(S_padded)
+M1 = expand_hash(A ‖ B ‖ K)          ← client proof
+POST /auth/v4  →  verify server proof M2, get uid + tokens
+```
+
+Session tokens are stored in the system keyring and never written to disk.
+
+## PGP key-decryption chain
+
+Proton Drive encrypts file names and node keys with a layered PGP key chain:
+
+```
+user password
+    │  hash_password(password, key_salt)   ← GET /core/v4/keys/salts
+    ▼
+key password  ──unlocks──►  address private key   (GET /core/v4/addresses)
+                                   │  decrypt share.passphrase
+                                   ▼
+                          share key passphrase
+                          ──unlocks──►  share private key   (share.key)
+                                             │  decrypt root_link.node_passphrase
+                                             ▼
+                                    root node key passphrase
+                                    ──unlocks──►  root node key
+                                                       │  decrypt child names / passphrases
+                                                       ▼
+                                                  plaintext filename
+                                                  (recurse for sub-folders)
+```
+
+---
+
+## CLI usage
 
 ```bash
-proton-drive auth login          # trigger OAuth flow
-proton-drive status              # show sync status
-proton-drive sync                # force an immediate sync cycle
-proton-drive conflicts list      # list unresolved conflicts
-proton-drive conflicts resolve <id> --keep [local|remote]
-proton-drive config set upload-limit 500   # KB/s
-proton-drive config set sync-window 22:00-06:00
+# Authentication
+proton-drive auth login           # interactive SRP login (prompts for username + password)
+proton-drive auth logout          # revoke session on server and remove from keyring
+proton-drive auth status          # print currently logged-in account
+
+# Remote file listing
+proton-drive ls                   # list root folder (encrypted names)
+proton-drive ls --decrypt         # list root folder with real names (prompts for password)
+proton-drive ls -r                # recursive walk, encrypted names
+proton-drive ls -r --decrypt      # recursive walk with real names
 ```
 
-#### GUI Desktop App
-
-A system-tray-first application that connects to the daemon socket. Provides:
-- Tray icon with sync status indicator
-- Conflict resolution dialogs
-- Settings panel (bandwidth limits, sync schedule, folder selection)
-- Live sync activity feed
-
-### IPC Protocol
-
-CLI and GUI communicate with the daemon via a **Unix domain socket** at `$XDG_RUNTIME_DIR/protond.sock`. Messages are length-prefixed JSON frames. The protocol is internal and versioned.
-
-### Storage Layout
-
-```
-~/.config/proton-drive/
-    config.toml          # user preferences (sync folder, bandwidth, schedule)
-
-~/.local/share/proton-drive/
-    state.db             # SQLite: file snapshots, sync queue, conflict log
-
-$XDG_RUNTIME_DIR/
-    protond.sock         # Unix socket (runtime only)
-    protond.pid          # PID file
-```
-
-Credentials (OAuth tokens) are stored exclusively in the **system keyring** (`libsecret` / GNOME Keyring / KWallet) and never written to disk in plaintext.
-
 ---
 
-## Planned Features
-
-- **Two-way sync** — Automatic bidirectional sync between a local folder and Proton Drive
-- **End-to-end encryption** — Full support for Proton's E2EE protocol
-- **Conflict resolution** — User-driven resolution with manual accept/reject per file
-- **Bandwidth management** — Per-direction rate caps and time-window scheduling
-- **System tray integration** — Background operation with live status
-- **Selective sync** — Choose which remote folders to mirror locally
-- **Resumable transfers** — Interrupted uploads/downloads resume from where they left off
-
----
-
-## Requirements
-
-- Linux Mint 21+ (Ubuntu 22.04 base or later)
-- A Proton account (Free or paid)
-- GNOME Keyring or compatible `libsecret` provider
-
----
-
-## Installation
-
-> Installation instructions will be added once the first release is available.
-
----
-
-## Building from Source
+## Building from source
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) 1.75 or later
-- `libsecret` development headers: `sudo apt install libsecret-1-dev`
+- [Rust](https://rustup.rs/) 1.75 or later (tested on 1.94.0)
+- `libsecret` development headers:
 
 ```bash
-# Clone the repository
+sudo apt install libsecret-1-dev pkg-config
+```
+
+### Build
+
+```bash
 git clone https://github.com/your-username/proton-drive-client.git
 cd proton-drive-client
 
-# Build all binaries
 cargo build --release
 
-# Binaries will be at:
-#   ./target/release/protond
-#   ./target/release/proton-drive
-#   ./target/release/proton-drive-app
+# Binaries:
+#   ./target/release/proton-drive   (CLI)
+#   ./target/release/protond        (daemon)
 ```
+
+### Run tests
+
+```bash
+cargo test
+
+# Live login test (requires a real Proton account):
+PROTON_USER=you@proton.me PROTON_PASS=yourpassword \
+    cargo test --test auth_integration -- --ignored
+```
+
+---
+
+## Storage layout
+
+```
+~/.config/proton-drive/
+    config.toml              user preferences (future)
+
+~/.local/share/proton-drive/
+    state.db                 SQLite: file snapshots, sync queue, conflicts (future)
+
+$XDG_RUNTIME_DIR/
+    protond.sock             Unix socket (future)
+    protond.pid              PID file (future)
+```
+
+Credentials are stored exclusively in the **system keyring** (libsecret / GNOME Keyring / KWallet) and never written to disk in plaintext.
 
 ---
 
 ## Roadmap
 
-- [ ] OAuth authentication with Proton (browser flow + libsecret storage)
-- [ ] Proton Drive API client (auth, file listing, upload, download)
+- [x] SRP-6a authentication (login, 2FA, logout, token refresh)
+- [x] Session storage in system keyring
+- [x] Proton Drive API client (volumes, shares, links, pagination)
+- [x] Remote file tree listing (depth-first walk, auto-paginated)
+- [x] PGP name decryption (full address → share → node key chain)
+- [ ] Verify PGP signature on SRP modulus
 - [ ] Local filesystem walker + hash cache
 - [ ] SQLite state store (snapshots, queue, conflicts)
 - [ ] Diff engine
 - [ ] Sync queue with job persistence
-- [ ] Transfer manager with rate limiting and scheduling
-- [ ] Unix socket IPC protocol
-- [ ] CLI client (`proton-drive`)
+- [ ] File upload / download (Proton block-based transfer protocol)
+- [ ] `protond` IPC socket (daemon ↔ CLI/GUI protocol)
+- [ ] Transfer manager with rate limiting and time-window scheduling
+- [ ] Conflict resolution
 - [ ] System tray GUI app
-- [ ] Conflict resolution UI
 - [ ] systemd user unit for auto-start
 - [ ] Packaging (`.deb`, AppImage, Flatpak)
 
 ---
 
-## Contributing
+## Key dependencies
 
-This project is in early planning. If you are interested in contributing, please open an issue to discuss ideas before submitting a pull request.
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/your-feature`)
-3. Commit your changes
-4. Open a pull request
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `reqwest` | 0.12 | HTTP client (rustls, no OpenSSL) |
+| `pgp` (rpgp) | 0.14 | OpenPGP key decryption |
+| `sha2` | 0.10 | SHA-512 for SRP `expand_hash` |
+| `bcrypt` | 0.15 | Password stretching (SRP + key-password) |
+| `num-bigint` | 0.4 | Arbitrary-precision integers for SRP |
+| `keyring` | 3 | libsecret / GNOME Keyring / KWallet |
+| `clap` | 4 | CLI argument parsing |
+| `serde` / `serde_json` | 1 | JSON serialisation |
+| `tokio` | 1 | Async runtime |
+| `thiserror` | 2 | Error type derivation |
 
 ---
 
-## License
+## Contributing
 
-This project is licensed under the [MIT License](LICENSE).
+The project is in active early development. If you are interested in contributing, please open an issue to discuss before submitting a pull request.
+
+---
 
 ## Disclaimer
 
 This is an unofficial, community-developed client. It is not affiliated with or endorsed by Proton AG. Use at your own risk.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

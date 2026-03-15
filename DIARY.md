@@ -88,7 +88,7 @@ Created `README.md` with:
 
 - Proton uses **SRP-6a** (RFC 5054 variant) for all account authentication.
 - The API endpoint is `POST /auth/v4/info` → `POST /auth/v4`.
-- All big-integer SRP values are transmitted as **little-endian** base64 bytes (non-standard).
+- All big-integer SRP values are transmitted as **big-endian** base64 bytes.
 - The 2048-bit prime modulus N is served **PGP-signed** from the API.
 - Password is stretched with **bcrypt** (cost 10) before entering SRP.
 - Reference implementations studied: `go-srp`, `proton-python-client`, `proton-api-rs` (archived).
@@ -133,18 +133,18 @@ proton-drive auth login
         │       └─ returns: modulus (PGP-signed N), server_ephemeral (B),
         │                   salt, srp_session, version
         │
-        ├─ bcrypt(password, salt, cost=10) → strip 29-char prefix → key_password
+        ├─ bcrypt(password, salt+"proton", cost=10) → full 60-byte string → bcrypt_output
         │
         ├─ SRP-6a computation
-        │       k  = H(N_le ‖ g_le)
+        │       k  = expand_hash(g_padded ‖ N_padded)
         │       a  = random 256-bit secret
         │       A  = g^a mod N
-        │       u  = H(A_le ‖ B_le)
-        │       x  = H(salt ‖ H(username:key_password))
+        │       u  = expand_hash(A_padded ‖ B_padded)
+        │       x  = expand_hash(bcrypt_output ‖ modulus_bytes)
         │       S  = (B − k·g^x)^(a + u·x) mod N
-        │       K  = H(S_le)
-        │       M1 = H(H(N)⊕H(g) ‖ H(username) ‖ salt ‖ A_le ‖ B_le ‖ K)
-        │       M2_expected = H(A_le ‖ M1 ‖ K)
+        │       K  = expand_hash(S_padded)
+        │       M1 = expand_hash(A_padded ‖ B_padded ‖ K)
+        │       M2_expected = expand_hash(A_padded ‖ M1 ‖ K)
         │
         ├─ POST /auth/v4 → { ClientEphemeral: A, ClientProof: M1, SRPSession }
         │       └─ returns: uid, access_token, refresh_token, server_proof (M2)
@@ -174,16 +174,14 @@ proton-drive auth login
 
 ---
 
-### 5. Known limitations / TODOs
+### 5. Known limitations / TODOs at end of session
 
-- [ ] PGP signature on the modulus is parsed but **not verified** against Proton's public key — must be added before production use.
-- [ ] Auth version < 4 is rejected; older accounts using legacy password schemes are not supported yet.
+- [ ] PGP signature on the modulus is parsed but **not verified** against Proton's public key.
+- [ ] Auth version < 4 is rejected; older accounts using legacy password schemes not supported.
 - [ ] Token refresh on expiry is implemented but not wired into an automatic retry loop.
 - [ ] `protond` daemon is a skeleton only — no IPC socket, no sync engine yet.
 - [ ] No unit tests yet for SRP math or bcrypt derivation.
 - [ ] Rust is not yet installed on the development machine — build not verified.
-
----
 
 ---
 
@@ -193,7 +191,7 @@ proton-drive auth login
 
 ### Research findings (go-srp source)
 
-Studying `ProtonMail/go-srp` revealed that my Session 1 implementation had several errors.
+Studying `ProtonMail/go-srp` revealed that the Session 1 SRP implementation had several errors.
 
 | Component | Session 1 (wrong) | Session 2 (corrected) |
 |-----------|-------------------|----------------------|
@@ -212,13 +210,11 @@ expand_hash(data) = SHA512(data‖0x00) ‖ SHA512(data‖0x01) ‖ SHA512(data�
                   = 256 bytes total
 ```
 
-#### Note on bcrypt "proton" salt suffix
+#### Note on bcrypt "proton" salt suffix (initial — later revised in Session 3)
 
-go-srp appends `"proton"` to the salt before bcrypt-base64 encoding it.
-Analysis shows this is mathematically a no-op: bcrypt internally *decodes* the
-base64 salt string back to 16 bytes, and the extra bits from `"proton"` fall below
-the precision boundary of the 22-character encoding.  The hash produced by
-`hash_with_salt(password, 10, salt_bytes)` is identical.
+Session 2 analysis concluded the `"proton"` suffix was a no-op because bcrypt decodes the
+base64 salt back to 16 bytes and the extra bits fall below the precision boundary.
+**This analysis was wrong** — see Session 3 for the correction.
 
 ### Files changed
 
@@ -226,7 +222,7 @@ the precision boundary of the 22-character encoding.  The hash produced by
 |------|--------|
 | `src/auth/srp.rs` | Full rewrite: `expand_hash`, big-endian, corrected M1/M2/x/k formulas |
 | `src/auth/password.rs` | Returns full 60-byte bcrypt string bytes (not stripped hash) |
-| `src/auth/mod.rs` | Updated call: passes `bcrypt_output` + `modulus_bytes` to `srp::generate_srp_proof`; removed `username` and `salt` from SRP call |
+| `src/auth/mod.rs` | Updated call: passes `bcrypt_output` + `modulus_bytes` to `srp::generate_srp_proof` |
 
 ### Tests written
 
@@ -270,13 +266,10 @@ the precision boundary of the 22-character encoding.  The hash produced by
 
 ### Known limitation
 
-The go-srp test vectors include expected M1/M2 values (`Qb+1+jEq…`, `SLCSICli…`)
-but the **modulus N** used in that test run is not hardcoded in go-srp — it was
-fetched live from Proton's API. Without the exact modulus we cannot reproduce the
-exact M1/M2 values.  The M1/M2 constants are kept as comments in
-`tests/auth_integration.rs` pending discovery of the test modulus.
-
----
+The go-srp test vectors include expected M1/M2 values but the **modulus N** used in that
+test run is fetched live from Proton's API and is not hardcoded in go-srp.  Without the
+exact modulus we cannot reproduce the exact M1/M2 values.  The constants are kept as
+comments in `tests/auth_integration.rs`.
 
 ---
 
@@ -325,7 +318,8 @@ Auth("Expected 16-byte salt, got 10 bytes")
 ### Root cause analysis
 
 The go-srp test salt `yKlc5/CvObfoiw==` decodes to **10 bytes**, not 16.
-This revealed two additional errors in `password.rs`:
+This revealed two additional errors in `password.rs`, and also corrected the Session 2
+analysis of the `"proton"` suffix:
 
 | Issue | Wrong | Correct |
 |-------|-------|---------|
@@ -333,9 +327,13 @@ This revealed two additional errors in `password.rs`:
 | `"proton"` suffix | Dismissed as no-op | Pads 10-byte salt to exactly 16 bytes: `10 + 6 = 16` |
 | Output prefix | `$2b$10$` (Rust crate default) | `$2y$10$` (Proton convention) — prefix is part of `x` input |
 
-**The "proton" suffix is not cosmetic.** For a 10-byte server salt, appending `"proton"` (6 bytes) produces exactly the 16 bytes bcrypt needs. My earlier analysis assumed a 16-byte salt where the suffix happened to be a no-op — that assumption was wrong.
+**The "proton" suffix is not cosmetic.** For a 10-byte server salt, appending `"proton"`
+(6 bytes) produces exactly the 16 bytes bcrypt needs.  The Session 2 analysis assumed a
+16-byte salt where the suffix happened to be a no-op — that assumption was wrong.
 
-**The `$2b$` → `$2y$` normalisation matters** because the full 60-byte bcrypt string is passed as input to `expand_hash` for `x` derivation. Different prefix → different `x` → wrong session key.
+**The `$2b$` → `$2y$` normalisation matters** because the full 60-byte bcrypt string is
+passed as input to `expand_hash` for `x` derivation.  Different prefix → different `x`
+→ wrong session key.
 
 ### Fixes applied to `password.rs`
 
@@ -354,16 +352,6 @@ running  4 tests  →   3 passed; 0 failed; 1 ignored   (integration tests)
 Total: **24 tests, 0 failures, 0 warnings.**
 The 1 ignored test (`live_login_succeeds`) requires real Proton credentials.
 
-### Next steps
-
-1. Obtain the Proton test modulus to enable exact M1/M2 vector verification.
-2. Verify PGP signature of the modulus (fingerprint `248097092b458509c508dac0350585c4e9518f26`).
-3. Begin remote filesystem enumeration (Proton Drive file listing API).
-
----
-
----
-
 ---
 
 ## Session 4 — 2026-03-15
@@ -375,7 +363,7 @@ The 1 ignored test (`live_login_succeeds`) requires real Proton credentials.
 | File | Change |
 |------|--------|
 | `crates/proton-core/src/api/drive_types.rs` | **Created** — all Drive API types |
-| `crates/proton-core/src/api/client.rs` | Added Drive API methods |
+| `crates/proton-core/src/api/client.rs` | Added Drive API methods + `authed_get` helper |
 | `crates/proton-core/src/api/mod.rs` | Export `drive_types` module |
 | `crates/proton-core/src/drive/mod.rs` | **Created** — `DriveClient`, `DriveNode`, `walk()` |
 | `crates/proton-core/src/lib.rs` | Export `drive` module |
@@ -406,7 +394,8 @@ are preserved as `Other(i32)` instead of crashing.
 | `get_link(share, link)` | `GET /drive/shares/{shareID}/links/{linkID}` |
 | `list_children(share, folder, page, size)` | `GET /drive/shares/{shareID}/folders/{linkID}/children` |
 
-A private `authed_get(path)` helper deduplicates the auth-header boilerplate.
+A private `authed_get(path)` helper deduplicates the auth-header boilerplate across all
+authenticated endpoints.
 
 ### Drive module (`src/drive/mod.rs`)
 
@@ -415,23 +404,20 @@ A private `authed_get(path)` helper deduplicates the auth-header boilerplate.
 | Method | What it does |
 |--------|-------------|
 | `find_main_share()` | Picks the active volume's share; returns `(share_id, root_link_id)` |
-| `list_children(share, folder)` | All pages of folder children |
+| `list_children(share, folder)` | All pages of folder children (auto-paginated) |
 | `list_root()` | Children of the share root |
 | `walk(share, folder, visitor)` | Depth-first tree walk via `Box::pin` recursion |
 | `walk_all()` | Full tree → `Vec<DriveNode>` |
 
-`DriveNode` is a flattened view of `Link` + `share_id`.  `display_name()` returns
-the encrypted name for now — PGP decryption is the next step.
+`DriveNode` is a flattened view of `Link` + `share_id`.  `display_name()` returns the
+encrypted name until PGP decryption is wired in.
 
 ### CLI `ls` command
 
-```
-proton-drive ls          # list root folder
+```bash
+proton-drive ls          # list root folder (encrypted names)
 proton-drive ls -r       # recursive walk of entire drive
 ```
-
-Output shows `DIR ` / `FILE` prefix and file size.
-Names are PGP-encrypted until decryption is implemented.
 
 ### Test results
 
@@ -442,12 +428,190 @@ doc-tests         →  1 passed (drive module doctest)
 Total: 25 tests, 0 failures, 0 warnings.
 ```
 
-### Next steps
+---
 
-1. PGP name decryption: unlock address key → unlock share key → unlock node key → decrypt names.
-2. Verify PGP signature on the modulus (fingerprint `248097092b458509c508dac0350585c4e9518f26`).
-3. Folder path argument for `ls` (currently always lists root / full tree).
-4. Begin local filesystem scan + SQLite state DB for sync diffing.
+## Session 5 — 2026-03-15
+
+### Goal: PGP name decryption
+
+### Key-decryption chain
+
+```
+user password
+    │  hash_password(password, key_salt)  ← GET /core/v4/keys/salts
+    ▼
+key password  ──unlocks──►  address private key  (GET /core/v4/addresses)
+                                   │
+                       pgp_decrypt(share.passphrase, address_key, key_pw)
+                                   ▼
+                        share key passphrase
+                        ──unlocks──►  share private key  (share.key)
+                                           │
+                           pgp_decrypt(root_link.node_passphrase, share_key, ...)
+                                           ▼
+                               root node key passphrase
+                               ──unlocks──►  root node key  (root_link.node_key)
+                                                   │
+                               pgp_decrypt(child.name, root_node_key, ...)
+                                                   ▼
+                                         plaintext filename
+```
+
+The key-password derivation reuses the existing `hash_password()` function (same bcrypt
+logic as SRP), but with the per-key salt from `/core/v4/keys/salts` instead of the
+SRP auth salt.
+
+### Files created / modified
+
+| File | Change |
+|------|--------|
+| `crates/proton-core/Cargo.toml` | Added `pgp = "0.14"` (rpgp 0.14.2) |
+| `crates/proton-core/src/error.rs` | Added `Crypto(String)` and `Utf8` error variants |
+| `crates/proton-core/src/api/types.rs` | Added `AddressKey`, `Address`, `KeySalt` types |
+| `crates/proton-core/src/api/client.rs` | Added `get_addresses()`, `get_key_salts()` |
+| `crates/proton-core/src/crypto/mod.rs` | **Created** — `pgp_decrypt()` |
+| `crates/proton-core/src/drive/keyring.rs` | **Created** — `DriveKeyring`, `derive_key_password()` |
+| `crates/proton-core/src/drive/mod.rs` | Added `build_keyring()`, `list_root_decrypted()` |
+| `crates/proton-core/src/lib.rs` | Export `crypto` module |
+| `crates/proton-drive/src/main.rs` | Added `--decrypt` flag to `ls` |
+
+### New API endpoints
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /core/v4/addresses` | All addresses with `Keys[]` (armored private keys) |
+| `GET /core/v4/keys/salts` | Per-key bcrypt salt for key-password derivation |
+
+Key-password rule: if `KeySalt` is non-empty → `hash_password(password, key_salt)`;
+if null/empty → use raw password bytes directly.
+
+### rpgp 0.14.2 API (confirmed by reading crate source)
+
+```rust
+use pgp::{Deserializable, Message, SignedSecretKey};
+use std::io::Cursor;
+
+let (key, _) = SignedSecretKey::from_armor_single(Cursor::new(armored_key.as_bytes()))?;
+let (msg, _) = Message::from_armor_single(Cursor::new(armored_msg.as_bytes()))?;
+// key_pw (FnOnce() -> String + Clone) is called to unlock the secret key's private material.
+let (decrypted, _) = msg.decrypt(|| key_password_str.clone(), &[&key])?;
+// get_content() handles both Literal and Compressed inner messages.
+let plaintext: Vec<u8> = decrypted.get_content()?.unwrap();
+```
+
+### `DriveKeyring` design
+
+Stores `(armored_key, passphrase_bytes)` per key ID.  Keys are parsed fresh on each
+decryption call to avoid lifetime complexity.
+
+| Method | What it does |
+|--------|-------------|
+| `init_share(share, addr_key, addr_pw)` | Decrypts share passphrase → stores share key entry |
+| `unlock_root_node(share_id, root_link)` | Decrypts root node passphrase with share key |
+| `unlock_node(link)` | Decrypts node passphrase with parent's key |
+| `decrypt_name(link)` | Decrypts `link.name` with parent's key → UTF-8 string |
+| `decrypt_name_raw(name, parent_id)` | Same, but takes raw fields instead of `&Link` |
+
+`DriveClient::build_keyring(password)` orchestrates the full bootstrap: fetches
+addresses, key salts, full share, and root link, then calls the above in order.
+
+### CLI usage
+
+```bash
+proton-drive ls               # list root (encrypted names, fast, no password needed)
+proton-drive ls --decrypt     # list root with real names (prompts for password)
+proton-drive ls -r            # recursive walk (encrypted names)
+```
+
+### Test results
+
+```
+25 tests, 0 failures, 0 warnings
+```
+
+No new unit tests added this session (crypto functions require live keys to test).
+
+### Open items / next steps
+
+1. ~~Recursive walk with decryption.~~ → **Done in Session 6**
+2. Verify PGP signature on the SRP modulus (fingerprint `248097092b458509c508dac0350585c4e9518f26`).
+3. Local filesystem scanner + SQLite state DB for sync diffing.
+4. `protond` IPC socket implementation.
+5. Token refresh wired into an automatic retry loop.
+
+---
+
+## Session 6 — 2026-03-15
+
+### Goal: recursive walk with decryption
+
+### Changes
+
+The key insight: during a depth-first walk, each folder's node key must be unlocked
+*before* recursing into it, so its children's names and passphrases can be decrypted.
+
+#### `DriveNode` — added crypto fields
+
+`node_key` and `node_passphrase` are now stored on every `DriveNode` (populated from
+the API response via `from_link`).  This lets the walker unlock sub-folder keys without
+making extra API calls.
+
+#### `DriveKeyring` — refactored to a unified key store
+
+The previous design had two separate HashMaps (`share_key` and `node_keys`).  These
+are now merged into a single `keys: HashMap<String, KeyEntry>` where the map key is
+either a `share_id` or a `link_id`.  This allows one lookup path for both:
+
+| Method | What it does |
+|--------|-------------|
+| `init_share(share, addr_key, addr_pw)` | Decrypts share passphrase → stores under `share_id` |
+| `unlock_with_parent(link_id, parent_id, node_key, node_passphrase)` | Decrypts passphrase with parent's key → stores under `link_id` |
+| `decrypt_name_raw(encrypted_name, parent_id)` | Decrypts a name using the key stored under `parent_id` |
+
+`parent_id` is seamlessly either a `share_id` (for the root link) or a `link_id`
+(for any other node) — both live in the same map.
+
+#### `DriveClient` — new methods
+
+| Method | What it does |
+|--------|-------------|
+| `build_keyring(password)` | Bootstraps keyring (share key + root node key); returns `(DriveKeyring, share_id, root_link_id)` |
+| `walk_decrypted(password, visitor)` | Depth-first walk; unlocks each folder key before recursing |
+| `walk_decrypted_inner(…)` | Internal recursive helper (pinned future for async recursion) |
+| `walk_all_decrypted(password)` | Convenience wrapper → `Vec<(DriveNode, String)>` |
+
+The walker falls back to the raw encrypted name if a key unlock fails (with a warning
+to stderr), so a single bad key does not abort the entire walk.
+
+#### Files modified
+
+| File | Change |
+|------|--------|
+| `src/drive/mod.rs` | `DriveNode`: +`node_key`, +`node_passphrase`; new `walk_decrypted`, `walk_all_decrypted` |
+| `src/drive/keyring.rs` | Unified key store; new `unlock_with_parent`; removed old `unlock_root_node` / `unlock_node` |
+| `crates/proton-drive/src/main.rs` | `ls --decrypt` now works for both root and `-r` |
+
+### CLI usage (complete)
+
+```bash
+proton-drive ls                   # root, encrypted names
+proton-drive ls --decrypt         # root, decrypted names (prompts for password)
+proton-drive ls -r                # full tree, encrypted names
+proton-drive ls -r --decrypt      # full tree, decrypted names (prompts for password)
+```
+
+### Test results
+
+```
+25 tests, 0 failures, 0 warnings
+```
+
+### Open items / next steps
+
+1. Verify PGP signature on the SRP modulus (fingerprint `248097092b458509c508dac0350585c4e9518f26`).
+2. Local filesystem scanner + SQLite state DB for sync diffing.
+3. `protond` IPC socket implementation.
+4. Token refresh wired into an automatic retry loop.
 
 ---
 

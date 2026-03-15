@@ -22,4 +22,10 @@ pub enum Error {
 
     #[error("Base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
+
+    #[error("Crypto error: {0}")]
+    Crypto(String),
+
+    #[error("UTF-8 decode error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
 }

@@ -19,3 +19,4 @@ rand     = "0.8"
 base64   = "0.22"
 keyring  = { version = "3", features = ["async-secret-service", "tokio", "crypto-rust"] }
 zeroize  = { version = "1", features = ["derive"] }
+pgp      = { version = "0.14", default-features = false }

@@ -21,9 +21,12 @@
 //! # }
 //! ```
 
+pub mod keyring;
+
 use crate::api::ApiClient;
 use crate::api::drive_types::{Link, LinkState, LinkType, VolumeState};
-use crate::Result;
+use crate::drive::keyring::{derive_key_password, DriveKeyring};
+use crate::{Error, Result};
 
 /// Page size for folder-children requests.
 const PAGE_SIZE: u32 = 150;
@@ -45,6 +48,13 @@ pub struct DriveNode {
     pub mime_type: String,
     pub create_time: i64,
     pub modify_time: i64,
+    /// PGP-armored encrypted private node key.
+    /// Needed by [`DriveKeyring`] to unlock this node's key so its children
+    /// can be decrypted.
+    pub node_key: String,
+    /// PGP-armored passphrase for `node_key` (encrypted with the parent's node key,
+    /// or with the share key for the root link).
+    pub node_passphrase: String,
 }
 
 impl DriveNode {
@@ -60,6 +70,8 @@ impl DriveNode {
             mime_type: link.mime_type,
             create_time: link.create_time,
             modify_time: link.modify_time,
+            node_key: link.node_key,
+            node_passphrase: link.node_passphrase,
         }
     }
 
@@ -179,5 +191,169 @@ impl DriveClient {
         self.walk(&share_id, &root_link_id, &mut |n| nodes.push(n.clone()))
             .await?;
         Ok(nodes)
+    }
+
+    // ── Decryption helpers ─────────────────────────────────────────────────
+
+    /// Build a [`DriveKeyring`] for the user's main share.
+    ///
+    /// # Arguments
+    /// - `user_password` — The user's plaintext login password.
+    ///
+    /// Fetches addresses, key salts, and the full share in order to bootstrap
+    /// the key chain.
+    pub async fn build_keyring(&self, user_password: &str) -> Result<(DriveKeyring, String, String)> {
+        let (share_id, root_link_id) = self.find_main_share().await?;
+
+        // Fetch full share (contains encrypted key + passphrase + address_key_id).
+        let share = self.api.get_share(&share_id).await?;
+
+        // Fetch address keys and key salts.
+        let addresses = self.api.get_addresses().await?;
+        let key_salts = self.api.get_key_salts().await?;
+
+        // Locate the specific address key referenced by the share.
+        let address_key = addresses
+            .iter()
+            .flat_map(|a| a.keys.iter())
+            .find(|k| k.id == share.address_key_id)
+            .ok_or_else(|| {
+                Error::Crypto(format!("address key {} not found", share.address_key_id))
+            })?;
+
+        // Derive key password using the key-specific salt.
+        let key_salt = key_salts
+            .iter()
+            .find(|s| s.id == address_key.id)
+            .and_then(|s| s.key_salt.as_deref());
+        let key_password = derive_key_password(user_password, key_salt)?;
+
+        // Bootstrap: share key → root node key.
+        let mut kr = DriveKeyring::new();
+        kr.init_share(&share, &address_key.private_key, &key_password)?;
+
+        // Unlock root link's node key (parent = share key, looked up by share_id).
+        let root_link = self.api.get_link(&share_id, &root_link_id).await?;
+        kr.unlock_with_parent(
+            &root_link.link_id,
+            &share_id,
+            &root_link.node_key,
+            &root_link.node_passphrase,
+        )?;
+
+        Ok((kr, share_id, root_link_id))
+    }
+
+    /// List root folder children with decrypted names.
+    ///
+    /// Returns `(node, plaintext_name)` pairs.
+    pub async fn list_root_decrypted(
+        &self,
+        user_password: &str,
+    ) -> Result<Vec<(DriveNode, String)>> {
+        let (kr, share_id, root_link_id) = self.build_keyring(user_password).await?;
+        let children = self.list_children(&share_id, &root_link_id).await?;
+
+        children
+            .into_iter()
+            .map(|node| {
+                // Every root child's name is encrypted with the root node key.
+                let name = kr.decrypt_name_raw(&node.encrypted_name, &root_link_id)?;
+                Ok((node, name))
+            })
+            .collect()
+    }
+
+    /// Recursively walk the entire drive tree with decrypted names.
+    ///
+    /// Calls `visitor` for every node encountered.  Node keys are unlocked
+    /// depth-first as folders are entered, so the keyring grows as the walk
+    /// descends.  `visitor` receives the node and its plaintext name.
+    pub async fn walk_decrypted<F>(
+        &self,
+        user_password: &str,
+        visitor: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&DriveNode, &str),
+    {
+        let (mut kr, share_id, root_link_id) = self.build_keyring(user_password).await?;
+        Box::pin(self.walk_decrypted_inner(
+            &share_id,
+            &root_link_id,
+            &root_link_id,
+            &mut kr,
+            visitor,
+        ))
+        .await
+    }
+
+    /// Walk all nodes under `folder_link_id` with decrypted names.
+    ///
+    /// `parent_key_id` is the key ring ID whose key was used to encrypt this
+    /// folder's children's names and node passphrases.  For the root folder
+    /// that equals `root_link_id`; for sub-folders it equals their own
+    /// `link_id`.
+    fn walk_decrypted_inner<'a, F>(
+        &'a self,
+        share_id: &'a str,
+        folder_link_id: &'a str,
+        parent_key_id: &'a str,
+        kr: &'a mut DriveKeyring,
+        visitor: &'a mut F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>
+    where
+        F: FnMut(&DriveNode, &str),
+    {
+        Box::pin(async move {
+            let children = self.list_children(share_id, folder_link_id).await?;
+
+            for node in &children {
+                // Decrypt this node's name using the parent folder's key.
+                let name = match kr.decrypt_name_raw(&node.encrypted_name, parent_key_id) {
+                    Ok(n) => n,
+                    Err(_) => node.encrypted_name.clone(), // fall back to raw on error
+                };
+
+                visitor(node, &name);
+
+                // If this is a folder, unlock its own node key and recurse.
+                if node.is_folder() && node.is_active() {
+                    if let Err(e) = kr.unlock_with_parent(
+                        &node.link_id,
+                        parent_key_id,
+                        &node.node_key,
+                        &node.node_passphrase,
+                    ) {
+                        // Key unlock failed: report the encrypted name and skip subtree.
+                        eprintln!("warn: could not unlock key for {}: {e}", node.link_id);
+                        continue;
+                    }
+
+                    self.walk_decrypted_inner(
+                        share_id,
+                        &node.link_id,
+                        &node.link_id,
+                        kr,
+                        visitor,
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Walk the entire drive and return `(node, plaintext_name)` pairs.
+    pub async fn walk_all_decrypted(
+        &self,
+        user_password: &str,
+    ) -> Result<Vec<(DriveNode, String)>> {
+        let mut items = Vec::new();
+        self.walk_decrypted(user_password, &mut |node, name| {
+            items.push((node.clone(), name.to_string()));
+        })
+        .await?;
+        Ok(items)
     }
 }
