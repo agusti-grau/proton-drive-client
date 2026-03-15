@@ -1,0 +1,13 @@
+[package]
+name    = "protond"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "protond"
+path = "src/main.rs"
+
+[dependencies]
+proton-core = { path = "../proton-core" }
+tokio       = { workspace = true }
+anyhow      = { workspace = true }
