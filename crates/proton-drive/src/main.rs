@@ -6,7 +6,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use proton_core::api::ApiClient;
 use proton_core::auth::{self, LoginResult};
+use proton_core::drive::DriveClient;
 use proton_core::keyring;
 
 // ── CLI definition ─────────────────────────────────────────────────────────
@@ -28,6 +30,15 @@ enum Commands {
     Auth {
         #[command(subcommand)]
         action: AuthCommands,
+    },
+    /// List files and folders in the remote drive.
+    Ls {
+        /// Folder path to list (not yet implemented — lists root for now).
+        #[arg(default_value = "/")]
+        path: String,
+        /// Recursively list all files and folders.
+        #[arg(short, long)]
+        recursive: bool,
     },
     /// Show sync status (requires protond to be running).
     Status,
@@ -51,12 +62,51 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Auth { action } => handle_auth(action).await,
+        Commands::Ls { recursive, .. } => cmd_ls(recursive).await,
         Commands::Status => {
             // TODO: connect to protond Unix socket and request status.
             println!("protond IPC not yet implemented.");
             Ok(())
         }
     }
+}
+
+// ── Drive handlers ─────────────────────────────────────────────────────────
+
+async fn cmd_ls(recursive: bool) -> Result<()> {
+    let session = keyring::load_session()
+        .context("Failed to read keyring")?
+        .ok_or_else(|| anyhow::anyhow!("Not logged in — run `proton-drive auth login` first"))?;
+
+    let api = ApiClient::new()
+        .context("Failed to build API client")?
+        .with_session(session);
+    let drive = DriveClient::new(api);
+
+    if recursive {
+        println!("Fetching full drive tree…");
+        let nodes = drive.walk_all().await.context("Failed to list drive")?;
+        for node in &nodes {
+            let kind = if node.is_folder() { "DIR " } else { "FILE" };
+            println!("{kind}  {}", node.display_name());
+        }
+        println!("\n{} item(s) total", nodes.len());
+    } else {
+        println!("Fetching root folder…");
+        let nodes = drive.list_root().await.context("Failed to list drive root")?;
+        for node in &nodes {
+            let kind = if node.is_folder() { "DIR " } else { "FILE" };
+            let size = if node.is_file() {
+                format!("  {:>12} B", node.size)
+            } else {
+                String::new()
+            };
+            println!("{kind}{size}  {}", node.display_name());
+        }
+        println!("\n{} item(s)", nodes.len());
+    }
+
+    Ok(())
 }
 
 // ── Auth handlers ──────────────────────────────────────────────────────────

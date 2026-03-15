@@ -2,6 +2,7 @@ use reqwest::{Client, header};
 
 use crate::{Error, Result};
 use crate::api::types::*;
+use crate::api::drive_types::*;
 
 /// Proton API base URL.
 const BASE_URL: &str = "https://mail.proton.me/api";
@@ -149,7 +150,110 @@ impl ApiClient {
         Ok(())
     }
 
+    // ── Drive endpoints ────────────────────────────────────────────────────
+
+    /// `GET /drive/volumes` — list all volumes for the authenticated user.
+    pub async fn list_volumes(&self) -> Result<Vec<Volume>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp { code: i32, volumes: Vec<Volume> }
+
+        let text = self.authed_get("/drive/volumes").await?;
+        let parsed: Resp = serde_json::from_str(&text)?;
+        if parsed.code != 1000 {
+            return Err(Error::Api { code: parsed.code, message: text });
+        }
+        Ok(parsed.volumes)
+    }
+
+    /// `GET /drive/shares` — list all shares visible to the user.
+    pub async fn list_shares(&self) -> Result<Vec<ShareMetadata>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp { code: i32, shares: Vec<ShareMetadata> }
+
+        let text = self.authed_get("/drive/shares?ShowAll=1").await?;
+        let parsed: Resp = serde_json::from_str(&text)?;
+        if parsed.code != 1000 {
+            return Err(Error::Api { code: parsed.code, message: text });
+        }
+        Ok(parsed.shares)
+    }
+
+    /// `GET /drive/shares/{id}` — fetch full share details (including keys).
+    pub async fn get_share(&self, share_id: &str) -> Result<Share> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp { code: i32, share: Share }
+
+        let text = self.authed_get(&format!("/drive/shares/{share_id}")).await?;
+        let parsed: Resp = serde_json::from_str(&text)?;
+        if parsed.code != 1000 {
+            return Err(Error::Api { code: parsed.code, message: text });
+        }
+        Ok(parsed.share)
+    }
+
+    /// `GET /drive/shares/{shareID}/links/{linkID}` — fetch a single link.
+    pub async fn get_link(&self, share_id: &str, link_id: &str) -> Result<Link> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp { code: i32, link: Link }
+
+        let text = self
+            .authed_get(&format!("/drive/shares/{share_id}/links/{link_id}"))
+            .await?;
+        let parsed: Resp = serde_json::from_str(&text)?;
+        if parsed.code != 1000 {
+            return Err(Error::Api { code: parsed.code, message: text });
+        }
+        Ok(parsed.link)
+    }
+
+    /// `GET /drive/shares/{shareID}/folders/{linkID}/children` — list folder children.
+    ///
+    /// Returns one page (up to `page_size` links).  Call repeatedly with
+    /// increasing `page` (0-indexed) until fewer than `page_size` links are
+    /// returned.
+    pub async fn list_children(
+        &self,
+        share_id: &str,
+        folder_link_id: &str,
+        page: u32,
+        page_size: u32,
+    ) -> Result<Vec<Link>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp { code: i32, links: Vec<Link> }
+
+        let url = format!(
+            "/drive/shares/{share_id}/folders/{folder_link_id}/children\
+             ?Page={page}&PageSize={page_size}&ShowAll=1"
+        );
+        let text = self.authed_get(&url).await?;
+        let parsed: Resp = serde_json::from_str(&text)?;
+        if parsed.code != 1000 {
+            return Err(Error::Api { code: parsed.code, message: text });
+        }
+        Ok(parsed.links)
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
+
+    /// Perform an authenticated GET to a path under `BASE_URL`.
+    async fn authed_get(&self, path: &str) -> Result<String> {
+        let session = self.require_session()?;
+        let text = self
+            .client
+            .get(format!("{BASE_URL}{path}"))
+            .header(header::AUTHORIZATION, format!("Bearer {}", session.access_token))
+            .header("x-pm-uid", &session.uid)
+            .send()
+            .await?
+            .text()
+            .await?;
+        Ok(text)
+    }
 
     fn require_session(&self) -> Result<&Session> {
         self.session

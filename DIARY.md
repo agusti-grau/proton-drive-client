@@ -362,4 +362,93 @@ The 1 ignored test (`live_login_succeeds`) requires real Proton credentials.
 
 ---
 
-*Last updated: 2026-03-14*
+---
+
+---
+
+## Session 4 — 2026-03-15
+
+### Goal: remote filesystem enumeration (listing)
+
+### Files created / modified
+
+| File | Change |
+|------|--------|
+| `crates/proton-core/src/api/drive_types.rs` | **Created** — all Drive API types |
+| `crates/proton-core/src/api/client.rs` | Added Drive API methods |
+| `crates/proton-core/src/api/mod.rs` | Export `drive_types` module |
+| `crates/proton-core/src/drive/mod.rs` | **Created** — `DriveClient`, `DriveNode`, `walk()` |
+| `crates/proton-core/src/lib.rs` | Export `drive` module |
+| `crates/proton-drive/src/main.rs` | Added `ls` subcommand |
+
+### Drive API types (`drive_types.rs`)
+
+All Proton Drive response/request types, using `#[serde(rename_all = "PascalCase")]`:
+
+| Type | Purpose |
+|------|---------|
+| `Volume`, `VolumeShare`, `VolumeState` | Top-level volume |
+| `ShareMetadata`, `Share`, `ShareType`, `ShareState`, `ShareFlags` | Share (root of a volume) |
+| `Link`, `LinkType`, `LinkState` | File/folder node |
+| `FileProperties`, `FolderProperties`, `RevisionMetadata`, `RevisionState` | Node details |
+| `CreateFolderReq`, `CreateFolderRes` | Folder creation (future use) |
+
+Integer enum pattern: manual `From<i32>` + custom `Deserialize` so unknown server values
+are preserved as `Other(i32)` instead of crashing.
+
+### Drive API client methods added to `client.rs`
+
+| Method | Endpoint |
+|--------|----------|
+| `list_volumes()` | `GET /drive/volumes` |
+| `list_shares()` | `GET /drive/shares?ShowAll=1` |
+| `get_share(id)` | `GET /drive/shares/{id}` |
+| `get_link(share, link)` | `GET /drive/shares/{shareID}/links/{linkID}` |
+| `list_children(share, folder, page, size)` | `GET /drive/shares/{shareID}/folders/{linkID}/children` |
+
+A private `authed_get(path)` helper deduplicates the auth-header boilerplate.
+
+### Drive module (`src/drive/mod.rs`)
+
+`DriveClient` wraps `ApiClient` with higher-level methods:
+
+| Method | What it does |
+|--------|-------------|
+| `find_main_share()` | Picks the active volume's share; returns `(share_id, root_link_id)` |
+| `list_children(share, folder)` | All pages of folder children |
+| `list_root()` | Children of the share root |
+| `walk(share, folder, visitor)` | Depth-first tree walk via `Box::pin` recursion |
+| `walk_all()` | Full tree → `Vec<DriveNode>` |
+
+`DriveNode` is a flattened view of `Link` + `share_id`.  `display_name()` returns
+the encrypted name for now — PGP decryption is the next step.
+
+### CLI `ls` command
+
+```
+proton-drive ls          # list root folder
+proton-drive ls -r       # recursive walk of entire drive
+```
+
+Output shows `DIR ` / `FILE` prefix and file size.
+Names are PGP-encrypted until decryption is implemented.
+
+### Test results
+
+```
+running 21 tests  → 21 passed (unit tests, proton-core)
+running  4 tests  →  3 passed; 1 ignored (integration, auth)
+doc-tests         →  1 passed (drive module doctest)
+Total: 25 tests, 0 failures, 0 warnings.
+```
+
+### Next steps
+
+1. PGP name decryption: unlock address key → unlock share key → unlock node key → decrypt names.
+2. Verify PGP signature on the modulus (fingerprint `248097092b458509c508dac0350585c4e9518f26`).
+3. Folder path argument for `ls` (currently always lists root / full tree).
+4. Begin local filesystem scan + SQLite state DB for sync diffing.
+
+---
+
+*Last updated: 2026-03-15*
